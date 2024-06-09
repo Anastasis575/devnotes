@@ -1,28 +1,22 @@
 use std::{env, fs};
-use std::alloc::Layout;
-use std::io::stdout;
-use std::path::Path;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
 use chrono::Utc;
-use clap::{Parser, Subcommand, ValueEnum};
-use crossterm::{event, ExecutableCommand};
-use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
-use ratatui::backend::CrosstermBackend;
-use ratatui::layout::Constraint::Fill;
-use ratatui::prelude::*;
-use ratatui::style::Stylize;
-use ratatui::Terminal;
+use clap::{Parser, Subcommand};
 use uuid::Uuid;
 
-use devnotes::{Note, Project};
+use commands::*;
 
-use crate::lib::{NoteRepository, ProjectRepository};
+use crate::backend::{Note, NoteRepository, Project, ProjectRepository};
+use crate::config::Config;
 use crate::sqlite::SqliteRepository;
 
-pub mod lib;
+pub mod backend;
 pub mod sqlite;
+mod config;
+mod commands;
 
 /// Simple program to add dev notes
 #[derive(Parser, Debug)]
@@ -49,14 +43,26 @@ enum CommandMode {
         date: Option<String>,
     },
     ///Delete note from project
+    #[command(name = "rm")]
     Delete {
         /// Guid prefix of the note to delete
         id: String
     },
     /// List notes for current project
-    List,
+    #[command(name = "ls")]
+    List {
+        #[arg(name = "g", short, long, action = clap::ArgAction::SetTrue)]
+        no_guid: bool
+    },
     /// List selectable Projects
     Projects,
+    /// View note
+    View {
+        /// id of the note
+        guid: String,
+        #[arg(name = "g", short, long, action = clap::ArgAction::SetTrue)]
+        no_guid: bool,
+    },
     /// Edit note
     Edit {
         /// id of the note
@@ -67,116 +73,103 @@ enum CommandMode {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Varargs::parse();
-    let exe_path = env::current_exe()?.join("..");
+    let binding = env::current_exe()?;
+    let exe_path = binding.parent().ok_or(anyhow!("bitch"))?;
+    let config = config::get_or_create_config(&exe_path).expect("Config did not exist...Default Created");
     let selected = (&exe_path).join("selected.txt").to_owned();
     let selected_proj = if !Path::new(&selected).exists() {
         fs::write(&selected, "")?;
-        ""
+        "".to_string()
     } else {
-        &fs::read_to_string(selected)?
+        fs::read_to_string(&selected)?
     };
-    let repo = SqliteRepository::default().await?;
-    println!("Project: {}", if !selected_proj.is_empty() { selected_proj } else { "Not Selected" });
-    if let CommandMode::Use = args.mode {} else if let CommandMode::Projects = args.mode {} else {
+    let mut repo = SqliteRepository::default().await?;
+    if let CommandMode::Use { .. } = args.mode {} else if let CommandMode::Projects = args.mode {} else {
         if selected_proj.is_empty() {
             return Err(anyhow!("No project selected please run with the \"use <proj_name>\" command first"));
         }
     }
     match args.mode {
         CommandMode::Use { project } => {
-            if let Err(_) = repo.list_project(match_name(&project)).await {
-                repo.insert_project(Project::new(Uuid::new_v4(), project.to_string(), Utc::now().naive_utc())).await?
+            println!("Project: {}", if !selected_proj.is_empty() { selected_proj.as_str() } else { "Not Selected" });
+
+            if let Ok(projs) = repo.list_project_with_filter(match_name(&project)).await {
+                if projs.is_empty() {
+                    repo.insert_project(Project::new(Uuid::new_v4().to_string(), project.to_string(), Utc::now().naive_utc())).await?
+                }
             }
-            fs::write(&selected, project)?;
+            fs::write(&selected, &project)?;
+            println!("Using Project: {project}")
         }
         CommandMode::Add { name, date } => {
+            println!("Project: {}", if !selected_proj.is_empty() { selected_proj.as_str() } else { "Not Selected" });
+            let default_name = config.default_name().to_owned();
+            let final_name = name.or_else(|| default_name);
+
             if selected_proj.is_empty() {
                 return Err(anyhow!("No project selected please run with the \"use <proj_name>\" command first"));
             }
-            let selected_proj_uuid = repo.list_project(match_name(&selected_proj.to_string())).await?.first().unwrap().guid();
+
+            let selected_projjj = repo.list_project_with_filter(match_name(&selected_proj.to_string())).await?.first().unwrap().to_owned();
 
             let date = match date {
                 None => Utc::now().naive_utc(),
                 Some(d) => chrono::naive::NaiveDateTime::parse_from_str(&d, "%Y-%m-%d %H:%M:%S")?
             };
-            let text = edit(&name, date, None)?;
-            repo.insert_note(Note::new(Uuid::new_v4().to_string(), selected_proj_uuid, name.ok_or_else(|| Some("")).unwrap(), text, date))
+            let editor = create_editor(&config, &exe_path);
+            let text = editor.edit(final_name.clone(), date, None)?;
+            repo.insert_note(Note::new(Uuid::new_v4().to_string(), selected_projjj.guid().to_owned(), final_name.clone().or_else(|| Some("".to_string())).unwrap(), text, date)).await?;
         }
         CommandMode::Delete { id } => {
-            repo.remove_note(id)
+            let notes = repo.list_note_with_filter(match_guid_prefix(&id)).await?;
+            check_guid_prefix_match(&notes)?;
+            let id = notes.first().unwrap().guid().to_string();
+            repo.remove_note(id).await?;
         }
-        CommandMode::List => {
-            let selected_proj_uuid = repo.list_project(match_name(&selected_proj.to_string())).await?.first().unwrap().guid();
+        CommandMode::List { no_guid } => {
+            println!("Project: {}", if !selected_proj.is_empty() { selected_proj.as_str() } else { "Not Selected" });
+
+            let selected_projj = repo.list_project_with_filter(&match_name(&selected_proj.to_string())).await?.first().unwrap().to_owned();
             println!("Notes for {}", &selected_proj);
-            let notes = repo.list_note(match_project_id(selected_proj_uuid)).await?;
+            let notes = repo.list_note_with_filter(match_project_id(selected_projj.guid())).await?;
             for note in notes {
-                println!("{}", note.guid());
-                println!("{}{}{}", empty_or_value(note.name(), note.name()), empty_or_value(note.name(), "|".to_string()), note.date().to_string())
+                println!("{}", note.get_print(config.include_time().or_else(|| Some(false)).unwrap(), no_guid))
             }
         }
         CommandMode::Projects => {
-            let list = repo.list_project(None).await?;
+            let list = repo.list_project().await?;
             for x in list {
                 println!("{}", x.name())
             }
         }
         CommandMode::Edit { guid } => {
+            println!("Project: {}", if !selected_proj.is_empty() { selected_proj.as_str() } else { "Not Selected" });
+
             if selected_proj.is_empty() {
                 return Err(anyhow!("No project selected please run with the \"use <proj_name>\" command first"));
             }
-            let note = repo.get_note(guid).await?;
-            let text = edit(note.name(), note.ts(), note.content())?;
+            let notes = repo.list_note_with_filter(match_guid_prefix(&guid)).await?;
+            check_guid_prefix_match(&notes)?;
+            let note = notes.first().unwrap().to_owned();
+            let editor = create_editor(&config, &exe_path);
+            let text = editor.edit(Some(note.name().to_string()), note.ts(), Some(note.content().to_string()))?;
 
-            repo.update_note(note.guid(), text).await?
+            repo.update_note(note.guid().to_string(), text).await?
+        }
+        CommandMode::View { guid, no_guid } => {
+            println!("Project: {}", if !selected_proj.is_empty() { selected_proj.as_str() } else { "Not Selected" });
+            let notes = repo.list_note_with_filter(match_guid_prefix(&guid)).await?;
+            check_guid_prefix_match(&notes)?;
+            let note = notes.first().unwrap().to_owned();
+            println!("{}", note.get_print(config.include_time().or_else(|| Some(false)).unwrap(), no_guid));
         }
     }
     Ok(())
 }
 
-fn match_name(name: &String) -> impl Fn(&Project) -> bool {
-    |it| it.name() == name
-}
-
-fn match_project_id(proj_id: &String) -> impl Fn(&Note) -> bool {
-    |it| it.project_id() == proj_id
-}
-
-fn empty_or_value(text: String, value: String) -> String {
-    if text.is_empty() { "".to_string() } else { value }
-}
-
-fn edit(name: &Option<String>, date: chrono::NaiveDateTime, text: Option<String>) -> Result<String> {
-    stdout().execute(EnterAlternateScreen)?;
-    enable_raw_mode()?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
-    terminal.clear()?;
-    let textarea = tui_textarea::TextArea::from(text.or_else(|| Some("".to_string())).unwrap().lines());
-    'main_loop: loop {
-        terminal.draw(|frame| {
-            let layout = Layout::default().direction(Direction::Vertical).constraints(
-                vec![Constraint::Length(1), Constraint::Min(1)]
-            ).split(frame.size());
-            let title = Layout::default().direction(Direction::Horizontal).constraints(
-                vec![Constraint::Percentage(25), Fill(1)]
-            ).split(layout[0]);
-            if let Some(n) = &name {
-                frame.render_widget(format!("{}|", n), title[0]);
-            }
-            frame.render_widget(format!("{}", date.to_string()), title[1]);
-            frame.render_widget(textarea.widget(), layout[1]);
-        })?;
-
-        if event::poll(std::time::Duration::from_millis(16))? {
-            if let event::Event::Key(key) = event::read()? {
-                if key.code == KeyCode::Esc || (key.kind == KeyEventKind::Press && key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('q')) {
-                    break 'main_loop;
-                }
-                (&textarea).input(key)
-            }
-        }
+fn create_editor<K: AsRef<OsStr> + ?Sized>(config: &Config, exe_path: &K) -> Box<dyn Editor> {
+    match config.edit_app() {
+        None => Box::new(InternalEditor {}),
+        Some(editor_command) => Box::new(ExternalEditor::new(editor_command.to_string(), PathBuf::from(exe_path)))
     }
-
-    stdout().execute(LeaveAlternateScreen)?;
-    disable_raw_mode()?;
-    Ok(textarea.lines().join("\n"))
 }
