@@ -5,15 +5,15 @@ use std::process::Command;
 
 use anyhow::anyhow;
 use anyhow::Result;
-use crossterm::{event, ExecutableCommand};
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
+use crossterm::{event, ExecutableCommand};
 use itertools::Itertools;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::layout::Constraint::Fill;
+use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::Terminal;
 use uuid::Uuid;
 
@@ -78,7 +78,10 @@ impl Editor for InternalEditor {
                 if let Some(n) = &name {
                     frame.render_widget(format!("{}|", n), title[0]);
                 }
-                frame.render_widget(format!("{}", date.format("%Y-%m-%d %H:%M:%S").to_string()), title[1]);
+                frame.render_widget(
+                    format!("{}", date.format("%Y-%m-%d %H:%M:%S").to_string()),
+                    title[1],
+                );
                 frame.render_widget(textarea.widget(), layout[1]);
             })?;
 
@@ -86,8 +89,8 @@ impl Editor for InternalEditor {
                 if let event::Event::Key(key) = event::read()? {
                     if key.code == KeyCode::Esc
                         || (key.kind == KeyEventKind::Press
-                        && key.modifiers == KeyModifiers::CONTROL
-                        && key.code == KeyCode::Char('q'))
+                            && key.modifiers == KeyModifiers::CONTROL
+                            && key.code == KeyCode::Char('q'))
                     {
                         break 'main_loop;
                     }
@@ -131,26 +134,25 @@ impl Editor for ExternalEditor {
         let path = self.exe_path().join(format!("{}.txt", local));
         let unwrapped_name = name.or_else(|| Some("".to_string())).unwrap();
         let mut builder = format!(
-            "{}{}{}",
+            "{}{}",
             if unwrapped_name.is_empty() {
                 "".to_string()
             } else {
                 format!("{}|", unwrapped_name)
             },
             date.format("%Y-%m-%d %H:%M:%S").to_string(),
-            if let Some(te) = text {
-                format!("\n{}", te)
-            } else {
-                "".to_string()
-            }
         );
         builder.push_str("\nDO NOT EDIT ABOVE THE LINE, CAUSE IT WILL NOT BE RECORDED(===)");
         builder.push_str("\n====================\n");
-
-        fs::write(
-            &path,
-            builder,
-        )?;
+        builder.push_str(
+            if let Some(te) = text {
+                format!("{}", te)
+            } else {
+                "".to_string()
+            }
+            .as_str(),
+        );
+        fs::write(&path, builder)?;
         let mut output = Command::new(self.command())
             .args([&path])
             .current_dir(self.exe_path)

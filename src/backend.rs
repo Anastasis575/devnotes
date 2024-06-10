@@ -4,7 +4,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use sqlx::FromRow;
 
-use crate::empty_or_value;
+use crate::{config::Config, empty_or_value};
 
 #[async_trait]
 pub trait Initable {
@@ -36,7 +36,7 @@ pub trait NoteRepository: Initable {
         &mut self,
         pred: T,
     ) -> Result<Vec<Note>>;
-    async fn update_note(&mut self, key: String, text: String) -> Result<()>;
+    async fn update_note(&mut self, key: String, text: String, project_id: String) -> Result<u64>;
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -71,7 +71,7 @@ pub struct Note {
 }
 
 impl Note {
-    pub(crate) fn get_print(&self, use_datetime: bool, no_guid: bool) -> String {
+    pub(crate) fn get_print(&self, config: &Config, no_guid: bool) -> String {
         let mut builder = String::new();
         if no_guid {
             builder.push_str(format!("{}\n", self.guid()).as_str());
@@ -82,21 +82,21 @@ impl Note {
                 empty_or_value(self.name().to_string(), self.name().to_string()),
                 if self.name().is_empty() { "" } else { "|" },
                 self.ts()
-                    .format(if use_datetime {
+                    .format(if !config.include_time() {
                         "%Y-%m-%d"
                     } else {
                         "%Y-%m-%d %H:%M:%S"
                     })
                     .to_string()
             )
-                .as_str(),
+            .as_str(),
         );
         builder.push_str(
             format!(
                 "{}\n",
                 empty_or_value(self.content().to_string(), "<EMPTY>".to_string())
             )
-                .as_str(),
+            .as_str(),
         );
         builder.push_str("=====================================");
         builder
